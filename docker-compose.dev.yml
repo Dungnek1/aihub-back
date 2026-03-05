@@ -1,0 +1,130 @@
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES
+  # ============================================
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: aihub_postgres_dev
+    restart: unless-stopped
+    env_file: .env.docker
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-hub-network-dev
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: aihub_pgadmin_dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env.docker
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "8080:80"
+    volumes:
+      - pgadmin_data_dev:/var/lib/pgadmin
+    networks:
+      - ai-hub-network-dev
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: aihub_rabbitmq_dev
+    restart: unless-stopped
+    env_file: .env.docker
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data_dev_v1:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-hub-network-dev
+
+  redis:
+    image: redis:7-alpine
+    container_name: aihub_redis_dev
+    restart: unless-stopped
+    env_file: .env.docker
+    command: >
+      sh -c "
+      if [ -n \"$$REDIS_PASSWORD\" ] && [ \"$$REDIS_PASSWORD\" != \"\" ]; then
+        redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\"
+      else
+        redis-server --appendonly yes
+      fi
+      "
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data_dev:/data
+    healthcheck:
+      test: >
+        sh -c "
+        if [ -n \"$$REDIS_PASSWORD\" ] && [ \"$$REDIS_PASSWORD\" != \"\" ]; then
+          redis-cli -a \"$$REDIS_PASSWORD\" ping || exit 1
+        else
+          redis-cli ping || exit 1
+        fi
+        "
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-hub-network-dev
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: aihub_redis_commander_dev
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:${REDIS_PASSWORD}
+    ports:
+      - "8081:8081"
+    networks:
+      - ai-hub-network-dev
+
+# ============================================
+# VOLUMES
+# ============================================
+volumes:
+  pgdata_dev:
+    driver: local
+  pgadmin_data_dev:
+    driver: local
+  rabbitmq_data_dev_v1:
+    driver: local
+  redis_data_dev:
+    driver: local
+
+# ============================================
+# NETWORKS
+# ============================================
+networks:
+  ai-hub-network-dev:
+    driver: bridge

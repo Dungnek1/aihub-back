@@ -1,0 +1,535 @@
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES
+  # ============================================
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: aihub_postgres
+    restart: always
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - traefik-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: aihub_pgadmin
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_CONFIG_PROXY_X_FOR_COUNT: 1
+      PGADMIN_CONFIG_PROXY_X_PROTO_COUNT: 1
+      PGADMIN_CONFIG_PROXY_X_HOST_COUNT: 1
+      PGADMIN_CONFIG_PROXY_X_PORT_COUNT: 1
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+    # ports:
+    #   - "8080:80"
+    expose:
+      - "80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - traefik-network
+    labels:
+      - "traefik.enable=true"
+      # HTTPS Router (HTTP redirect handled by Traefik entrypoint)
+      - "traefik.http.routers.pgadmin.rule=Host(`tools-pgadmin.aihubvietnam.com`)"
+      - "traefik.http.routers.pgadmin.entrypoints=websecure"
+      - "traefik.http.routers.pgadmin.tls=true"
+      - "traefik.http.routers.pgadmin.tls.certresolver=le"
+      - "traefik.http.services.pgadmin.loadbalancer.server.port=80"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: aihub_rabbitmq
+    restart: always
+    env_file: .env
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - traefik-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: aihub_redis
+    restart: always
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - traefik-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: aihub_redis_commander
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:${REDIS_PASSWORD}
+    # ports:
+    #   - "8081:8081"
+    expose:
+      - "8081"
+    labels:
+      - "traefik.enable=true"
+      # Router theo domain
+      - "traefik.http.routers.redis-commander.rule=Host(`tools-redis.aihubvietnam.com`)"
+      - "traefik.http.routers.redis-commander.entrypoints=websecure"
+      - "traefik.http.routers.redis-commander.tls.certresolver=le"
+      # Service trỏ vào cổng nội bộ của app
+      - "traefik.http.services.redis-commander.loadbalancer.server.port=8081"  
+      - "traefik.http.middlewares.redis-commander-hdr.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.redis-commander-hdr.headers.customrequestheaders.X-Forwarded-Host=tools-redis.aihubvietnam.com"
+      - "traefik.http.routers.redis-commander.middlewares=redis-commander-hdr"  
+    networks:
+      - traefik-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # APPLICATION SERVICES - Production
+  # ============================================
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: apps/api-gateway/Dockerfile
+    container_name: aihub_api_gateway
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    ports:
+      - "${API_GATEWAY_PORT}:${API_GATEWAY_PORT}"
+    expose:
+      - "${API_GATEWAY_PORT}"
+    volumes:
+      - api_gateway_logs:/app/logs
+      - uploaded_files:/app/public
+    networks:
+      - traefik-network
+    labels:
+      - "traefik.enable=true"
+      # HTTPS Router (HTTP redirect handled by Traefik entrypoint)
+      - "traefik.http.routers.api-gateway.rule=Host(`api-dashboard.aihubvietnam.com`)"
+      - "traefik.http.routers.api-gateway.entrypoints=websecure"
+      - "traefik.http.routers.api-gateway.tls=true"
+      - "traefik.http.routers.api-gateway.tls.certresolver=le"
+      - "traefik.http.services.api-gateway.loadbalancer.server.port=${API_GATEWAY_PORT}"
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: apps/auth-service/Dockerfile
+    container_name: aihub_auth_service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${AUTH_SERVICE_PORT}:${AUTH_SERVICE_PORT}"
+    volumes:
+      - auth_service_logs:/app/logs
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  admin-service:
+    build:
+      context: .
+      dockerfile: apps/admin-service/Dockerfile
+    container_name: aihub_admin_service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      POSTGRES_HOST: postgres
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${ADMIN_SERVICE_PORT}:${ADMIN_SERVICE_PORT}"
+    # volumes:
+    #   - admin_service_logs:/app/logs
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  blog-service:
+    build:
+      context: .
+      dockerfile: apps/blog-service/Dockerfile
+    container_name: aihub_blog_service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      POSTGRES_HOST: postgres
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${BLOG_SERVICE_PORT}:${BLOG_SERVICE_PORT}"
+    volumes:
+      - blog_service_logs:/app/logs
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  media-service:
+    build:
+      context: .
+      dockerfile: apps/media-service/Dockerfile
+    container_name: aihub_media_service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${MEDIA_SERVICE_PORT}:${MEDIA_SERVICE_PORT}"
+    volumes:
+      - uploaded_files:/app/public
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: apps/notification-service/Dockerfile
+    container_name: aihub_notification_service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    # ports:
+    #   - "${NOTIFICATION_SERVICE_PORT}:${NOTIFICATION_SERVICE_PORT}"
+    expose:
+      - "${NOTIFICATION_SERVICE_PORT}"
+    volumes:
+      - notification_service_logs:/app/logs
+    networks:
+      - traefik-network
+    labels:
+      - "traefik.enable=true"
+      # HTTPS Router
+      - "traefik.http.routers.notification-service.rule=Host(`noti.aihubvietnam.com`)"
+      - "traefik.http.routers.notification-service.entrypoints=websecure"
+      - "traefik.http.routers.notification-service.tls=true"
+      - "traefik.http.routers.notification-service.tls.certresolver=le"
+      - "traefik.http.services.notification-service.loadbalancer.server.port=${NOTIFICATION_SERVICE_PORT}"
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+  tool-service:
+    build:
+      context: .
+      dockerfile: apps/tool-service/Dockerfile
+    container_name: aihub_tool_service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${TOOL_SERVICE_PORT}:${TOOL_SERVICE_PORT}"
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  support-service:
+    build:
+      context: .
+      dockerfile: apps/support-service/Dockerfile
+    container_name: aihub_support_service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      POSTGRES_HOST: postgres
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${SUPPORT_SERVICE_PORT}:${SUPPORT_SERVICE_PORT}"
+    volumes:
+      - support_service_logs:/app/logs
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tool-marketing-service:
+    build:
+      context: .
+      dockerfile: apps/tool-marketing-service/Dockerfile
+    container_name: aihub_tool_marketing_service
+    restart: always
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${TOOL_MARKETING_SERVICE_PORT}:${TOOL_MARKETING_SERVICE_PORT}"
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  course-service:
+    build:
+      context: .
+      dockerfile: apps/course-service/Dockerfile
+    container_name: aihub_course_service
+    restart: always
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${COURSE_SERVICE_PORT}:${COURSE_SERVICE_PORT}"
+    networks:
+      - traefik-network
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ============================================
+# VOLUMES
+# ============================================
+volumes:
+  pgdata:
+    driver: local
+  pgadmin_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  redis_data:
+    driver: local
+  api_gateway_logs:
+    driver: local
+  auth_service_logs:
+    driver: local
+  admin_service_logs:
+    driver: local
+  blog_service_logs:
+    driver: local
+  notification_service_logs:
+    driver: local
+  support_service_logs:
+    driver: local
+  uploaded_files:
+    driver: local
+
+# ============================================
+# NETWORKS
+# ============================================
+networks:
+  traefik-network:
+    external: true
+

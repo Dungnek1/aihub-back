@@ -1,0 +1,94 @@
+# ============================================
+# STAGE 1: Dependencies
+# ============================================
+FROM node:22.19-alpine AS deps
+
+WORKDIR /app
+
+# Install dependencies for better caching
+RUN apk add --no-cache libc6-compat curl
+
+# Copy package files
+COPY package*.json ./
+
+# Configure npm for better reliability
+RUN npm config set registry https://registry.npmjs.org/ && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-retries 10 && \
+    npm config set fetch-timeout 600000
+
+# Install dependencies with fallback
+RUN npm ci --no-audit --no-fund || \
+    (echo "First attempt failed, trying again..." && sleep 10 && npm ci --no-audit --no-fund) || \
+    (echo "Second attempt failed, final try..." && sleep 20 && npm ci --no-audit --no-fund)
+
+# ============================================
+# STAGE 2: Builder
+# ============================================
+FROM node:22.19-alpine AS builder
+
+WORKDIR /app
+
+# Copy dependencies from deps stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy source code
+COPY package*.json ./
+COPY tsconfig.json ./
+COPY tsconfig.build.json ./
+COPY nest-cli.json ./
+COPY libs ./libs
+COPY apps/api-gateway ./apps/api-gateway
+
+# Build application
+RUN npx nest build api-gateway
+
+# ============================================
+# STAGE 3: Production
+# ============================================
+FROM node:22.19-alpine AS runner
+
+WORKDIR /app
+
+# Install dumb-init for proper signal handling
+RUN apk add --no-cache dumb-init curl
+
+# Create app user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nestjs -u 1001
+
+# Copy package.json
+COPY package*.json ./
+
+# Configure npm and install production dependencies
+RUN npm config set registry https://registry.npmjs.org/ && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-retries 10 && \
+    npm config set fetch-timeout 600000
+
+# Install production dependencies with fallback
+RUN npm ci --only=production --no-audit --no-fund || \
+    (echo "Production install failed, retrying..." && sleep 10 && npm ci --only=production --no-audit --no-fund) || \
+    (echo "Second attempt failed, final try..." && sleep 20 && npm ci --only=production --no-audit --no-fund) && \
+    npm cache clean --force
+
+# Copy built application
+COPY --from=builder --chown=nestjs:nodejs /app/dist ./dist
+
+# Switch to nodejs user
+USER nestjs
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:9000/', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"
+
+# Expose port
+EXPOSE 9000
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["/sbin/dumb-init", "--"]
+
+# Start application
+CMD ["node", "dist/apps/api-gateway/main.js"]
